@@ -240,7 +240,7 @@ Here are some limitations imposed on the P4 programs:
 
 * checksum computations are not implemented.  In consequence, programs
   that IP/TCP/UDP headers will produce incorrect packet headers.
-  
+
 * EBPF does not offer support for ternary or LPM tables
 
 * P4 cloning and recirculation and not supported

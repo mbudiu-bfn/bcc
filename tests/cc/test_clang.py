@@ -214,6 +214,54 @@ int kprobe__sys_open(struct pt_regs *ctx, const char *filename,
 };
 """)
 
+    def test_task_switch(self):
+        b = BPF(text="""
+#include <uapi/linux/ptrace.h>
+#include <linux/sched.h>
+struct key_t {
+  u32 prev_pid;
+  u32 curr_pid;
+};
+BPF_TABLE("hash", struct key_t, u64, stats, 1024);
+int kprobe__finish_task_switch(struct pt_regs *ctx, struct task_struct *prev) {
+  struct key_t key = {};
+  u64 zero = 0, *val;
+  key.curr_pid = bpf_get_current_pid_tgid();
+  key.prev_pid = prev->pid;
+
+  val = stats.lookup_or_init(&key, &zero);
+  (*val)++;
+  return 0;
+}
+""")
+
+    def test_probe_simple_assign(self):
+        b = BPF(text="""
+#include <uapi/linux/ptrace.h>
+#include <linux/gfp.h>
+struct leaf { size_t size; };
+BPF_HASH(simple_map, u32, struct leaf);
+int kprobe____kmalloc(struct pt_regs *ctx, size_t size) {
+    u32 pid = bpf_get_current_pid_tgid();
+    struct leaf* leaf = simple_map.lookup(&pid);
+    if (leaf)
+        leaf->size += size;
+    return 0;
+}""", debug=4)
+
+    def test_unop_probe_read(self):
+        text = """
+#include <linux/blkdev.h>
+int trace_entry(struct pt_regs *ctx, struct request *req) {
+    if (!(req->bio->bi_rw & 1))
+        return 1;
+    if (((req->bio->bi_rw)))
+        return 1;
+    return 0;
+}
+"""
+        b = BPF(text=text)
+        fn = b.load_func("trace_entry", BPF.KPROBE)
 
 if __name__ == "__main__":
     main()

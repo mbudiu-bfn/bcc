@@ -85,7 +85,7 @@ class EbpfDeparser(object):
         assert isinstance(program, ebpfProgram.EbpfProgram)
         p4header = header.hlirInstance
         assert isinstance(p4header, p4_header_instance)
-        
+
         serializer.emitIndent()
         serializer.appendFormat("if ({0}.{1}.valid) ",
                                 program.headerStructName, header.name)
@@ -155,7 +155,7 @@ class EbpfDeparser(object):
         serializer.appendFormat("{0} += {1};",
                                 program.offsetVariableName, width)
         serializer.newline()
-    
+
     def generatePacketStore(self, value, offset, alignment, width, program):
         assert width > 0
         assert alignment < 8

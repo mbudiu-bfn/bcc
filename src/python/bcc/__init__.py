@@ -18,6 +18,7 @@ from collections import MutableMapping
 import ctypes as ct
 import fcntl
 import json
+import multiprocessing
 import os
 from subprocess import Popen, PIPE
 import sys
@@ -86,11 +87,22 @@ lib.bpf_attach_socket.argtypes = [ct.c_int, ct.c_int]
 lib.bpf_prog_load.restype = ct.c_int
 lib.bpf_prog_load.argtypes = [ct.c_int, ct.c_void_p, ct.c_size_t,
         ct.c_char_p, ct.c_uint, ct.c_char_p, ct.c_uint]
-lib.bpf_attach_kprobe.restype = ct.c_int
-lib.bpf_attach_kprobe.argtypes = [ct.c_int, ct.c_char_p,
-        ct.c_char_p, ct.c_int, ct.c_int, ct.c_int]
+lib.bpf_attach_kprobe.restype = ct.c_void_p
+_CB_TYPE = ct.CFUNCTYPE(None, ct.py_object, ct.c_int,
+        ct.c_ulonglong, ct.POINTER(ct.c_ulonglong))
+_RAW_CB_TYPE = ct.CFUNCTYPE(None, ct.py_object, ct.c_void_p, ct.c_int)
+lib.bpf_attach_kprobe.argtypes = [ct.c_int, ct.c_char_p, ct.c_char_p, ct.c_int,
+        ct.c_int, ct.c_int, _CB_TYPE, ct.py_object]
 lib.bpf_detach_kprobe.restype = ct.c_int
 lib.bpf_detach_kprobe.argtypes = [ct.c_char_p]
+lib.bpf_open_perf_buffer.restype = ct.c_void_p
+lib.bpf_open_perf_buffer.argtypes = [_RAW_CB_TYPE, ct.py_object, ct.c_int, ct.c_int]
+lib.perf_reader_poll.restype = ct.c_int
+lib.perf_reader_poll.argtypes = [ct.c_int, ct.POINTER(ct.c_void_p), ct.c_int]
+lib.perf_reader_free.restype = None
+lib.perf_reader_free.argtypes = [ct.c_void_p]
+lib.perf_reader_fd.restype = int
+lib.perf_reader_fd.argtypes = [ct.c_void_p]
 
 open_kprobes = {}
 tracefile = None
@@ -99,14 +111,16 @@ KALLSYMS = "/proc/kallsyms"
 ksym_addrs = []
 ksym_names = []
 ksym_loaded = 0
-stars_max = 38
+stars_max = 40
 
 @atexit.register
 def cleanup_kprobes():
     for k, v in open_kprobes.items():
-        os.close(v)
-        desc = "-:kprobes/%s" % k
-        lib.bpf_detach_kprobe(desc.encode("ascii"))
+        lib.perf_reader_free(v)
+        if isinstance(k, str):
+            desc = "-:kprobes/%s" % k
+            lib.bpf_detach_kprobe(desc.encode("ascii"))
+    open_kprobes.clear()
     if tracefile:
         tracefile.close()
 
@@ -119,6 +133,7 @@ class BPF(object):
     HASH = 1
     ARRAY = 2
     PROG_ARRAY = 3
+    PERF_EVENT_ARRAY = 4
 
     class Function(object):
         def __init__(self, bpf, name, fd):
@@ -134,6 +149,7 @@ class BPF(object):
             self.Key = keytype
             self.Leaf = leaftype
             self.ttype = lib.bpf_table_type_id(self.bpf.module, self.map_id)
+            self._cbs = {}
 
         def key_sprintf(self, key):
             key_p = ct.pointer(key)
@@ -171,6 +187,35 @@ class BPF(object):
                 raise Exception("Could not scanf leaf")
             return leaf
 
+        def open_perf_buffer(self, callback):
+            """open_perf_buffers(callback)
+
+            Opens a set of per-cpu ring buffer to receive custom perf event
+            data from the bpf program. The callback will be invoked for each
+            event submitted from the kernel, up to millions per second.
+            """
+
+            for i in range(0, multiprocessing.cpu_count()):
+                self._open_perf_buffer(i, callback)
+
+        def _open_perf_buffer(self, cpu, callback):
+            fn = _RAW_CB_TYPE(lambda _, data, size: callback(cpu, data, size))
+            reader = lib.bpf_open_perf_buffer(fn, None, -1, cpu)
+            if not reader:
+                raise Exception("Could not open perf buffer")
+            fd = lib.perf_reader_fd(reader)
+            self[self.Key(cpu)] = self.Leaf(fd)
+            open_kprobes[(id(self), cpu)] = reader
+            # keep a refcnt
+            self._cbs[cpu] = fn
+
+        def close_perf_buffer(self, key):
+            reader = open_kprobes.get((id(self), key))
+            if reader:
+                lib.perf_reader_free(reader)
+                del(open_kprobes[(id(self), key)])
+            del self._cbs[key]
+
         def __getitem__(self, key):
             key_p = ct.pointer(key)
             leaf = self.Leaf()
@@ -201,7 +246,7 @@ class BPF(object):
             ttype = lib.bpf_table_type_id(self.bpf.module, self.map_id)
             # Deleting from array type maps does not have an effect, so
             # zero out the entry instead.
-            if ttype in (BPF.ARRAY, BPF.PROG_ARRAY):
+            if ttype in (BPF.ARRAY, BPF.PROG_ARRAY, BPF.PERF_EVENT_ARRAY):
                 leaf = self.Leaf()
                 leaf_p = ct.pointer(leaf)
                 res = lib.bpf_update_elem(self.map_fd,
@@ -209,6 +254,8 @@ class BPF(object):
                         ct.cast(leaf_p, ct.c_void_p), 0)
                 if res < 0:
                     raise Exception("Could not clear item")
+                if ttype == BPF.PERF_EVENT_ARRAY:
+                    self.close_perf_buffer(key)
             else:
                 res = lib.bpf_delete_elem(self.map_fd,
                         ct.cast(key_p, ct.c_void_p))
@@ -216,14 +263,9 @@ class BPF(object):
                     raise KeyError
 
         def clear(self):
-            if self.ttype in (BPF.ARRAY, BPF.PROG_ARRAY):
-                # Special case clear, since this class is currently behaving
-                # like a dict but popitem on an array causes an infinite loop.
-                # TODO: derive Table from array.array instead
-                for k in self.keys():
-                    self.__delitem__(k)
-            else:
-                super(BPF.Table, self).clear()
+            # default clear uses popitem, which can race with the bpf prog
+            for k in self.keys():
+                self.__delitem__(k)
 
         @staticmethod
         def _stars(val, val_max, width):
@@ -238,38 +280,68 @@ class BPF(object):
                 text = text[:-1] + "+"
             return text
 
-        def print_log2_hist(self, val_type="value"):
-            """print_log2_hist(type=value)
+        def print_log2_hist(self, val_type="value", section_header="Bucket ptr",
+                section_print_fn=None):
+            """print_log2_hist(val_type="value", section_header="Bucket ptr",
+                               section_print_fn=None)
 
             Prints a table as a log2 histogram. The table must be stored as
-            log2. The type argument is optional, and is a column header.
+            log2. The val_type argument is optional, and is a column header.
+            If the histogram has a secondary key, multiple tables will print
+            and section_header can be used as a header description for each.
+            If section_print_fn is not None, it will be passed the bucket value
+            to format into a string as it sees fit.
             """
+            if isinstance(self.Key(), ct.Structure):
+                tmp = {}
+                f1 = self.Key._fields_[0][0]
+                f2 = self.Key._fields_[1][0]
+                for k, v in self.items():
+                    bucket = getattr(k, f1)
+                    vals = tmp[bucket] = tmp.get(bucket, [0] * 65)
+                    slot = getattr(k, f2)
+                    vals[slot] = v.value
+                for bucket, vals in tmp.items():
+                    if section_print_fn:
+                        print("\n%s = %s" % (section_header,
+                            section_print_fn(bucket)))
+                    else:
+                        print("\n%s = %r" % (section_header, bucket))
+                    self._print_log2_hist(vals, val_type, 0)
+            else:
+                vals = [0] * 65
+                for k, v in self.items():
+                    vals[k.value] = v.value
+                self._print_log2_hist(vals, val_type, 0)
+
+        def _print_log2_hist(self, vals, val_type, val_max):
             global stars_max
             log2_dist_max = 64
             idx_max = -1
-            val_max = 0
-            for i in range(1, log2_dist_max + 1):
-                try:
-                    val = self[ct.c_int(i)].value
-                    if (val > 0):
-                        idx_max = i
-                    if (val > val_max):
-                        val_max = val
-                except:
-                    break
+
+            for i, v in enumerate(vals):
+                if v > 0: idx_max = i
+                if v > val_max: val_max = v
+
+            if idx_max <= 32:
+                header = "     %-19s : count     distribution"
+                body = "%10d -> %-10d : %-8d |%-*s|"
+                stars = stars_max
+            else:
+                header = "               %-29s : count     distribution"
+                body = "%20d -> %-20d : %-8d |%-*s|"
+                stars = int(stars_max / 2)
+
             if idx_max > 0:
-                print("     %-15s : count     distribution" % val_type);
+                print(header % val_type);
             for i in range(1, idx_max + 1):
                 low = (1 << i) >> 1
                 high = (1 << i) - 1
                 if (low == high):
                     low -= 1
-                try:
-                    val = self[ct.c_int(i)].value
-                    print("%8d -> %-8d : %-8d |%-*s|" % (low, high, val,
-                        stars_max, self._stars(val, val_max, stars_max)))
-                except:
-                    break
+                val = vals[i]
+                print(body % (low, high, val, stars,
+                              self._stars(val, val_max, stars)))
 
 
         def __iter__(self):
@@ -282,7 +354,16 @@ class BPF(object):
             def __init__(self, table, keytype):
                 self.Key = keytype
                 self.table = table
-                self.key = self.Key()
+                k = self.Key()
+                kp = ct.pointer(k)
+                # if 0 is a valid key, try a few alternatives
+                if k in table:
+                    ct.memset(kp, 0xff, ct.sizeof(k))
+                    if k in table:
+                        ct.memset(kp, 0x55, ct.sizeof(k))
+                        if k in table:
+                            raise Exception("Unable to allocate iterator")
+                self.key = k
             def __iter__(self):
                 return self
             def __next__(self):
@@ -314,7 +395,7 @@ class BPF(object):
                     raise Exception("Could not find file %s" % filename)
         return filename
 
-    def __init__(self, src_file="", hdr_file="", text=None, debug=0):
+    def __init__(self, src_file="", hdr_file="", text=None, cb=None, debug=0):
         """Create a a new BPF module with the given source code.
 
         Note:
@@ -330,6 +411,8 @@ class BPF(object):
                 0x2: print BPF bytecode to stderr
         """
 
+        self._reader_cb_impl = _CB_TYPE(BPF._reader_cb)
+        self._user_cb = cb
         self.debug = debug
         self.funcs = {}
         self.tables = {}
@@ -407,7 +490,6 @@ class BPF(object):
         u"_Bool": ct.c_bool,
         u"char": ct.c_char,
         u"wchar_t": ct.c_wchar,
-        u"char": ct.c_byte,
         u"unsigned char": ct.c_ubyte,
         u"short": ct.c_short,
         u"unsigned short": ct.c_ushort,
@@ -430,7 +512,12 @@ class BPF(object):
             if len(t) == 2:
                 fields.append((t[0], BPF._decode_table_type(t[1])))
             elif len(t) == 3:
-                fields.append((t[0], BPF._decode_table_type(t[1]), t[2]))
+                if isinstance(t[2], list):
+                    fields.append((t[0], BPF._decode_table_type(t[1]) * t[2][0]))
+                else:
+                    fields.append((t[0], BPF._decode_table_type(t[1]), t[2]))
+            else:
+                raise Exception("Failed to decode type %s" % str(t))
         cls = type(str(desc[0]), (ct.Structure,), dict(_fields_=fields))
         return cls
 
@@ -468,6 +555,11 @@ class BPF(object):
     def __iter__(self):
         return self.tables.__iter__()
 
+    def _reader_cb(self, pid, callchain_num, callchain):
+        if self._user_cb:
+            cc = tuple(callchain[i] for i in range(0, callchain_num))
+            self._user_cb(pid, cc)
+
     @staticmethod
     def attach_raw_socket(fn, dev):
         if not isinstance(fn, BPF.Function):
@@ -494,7 +586,7 @@ class BPF(object):
                 (line != "\n" and line not in blacklist)]
 
     def attach_kprobe(self, event="", fn_name="", event_re="",
-            pid=0, cpu=-1, group_fd=-1):
+            pid=-1, cpu=0, group_fd=-1):
 
         # allow the caller to glob multiple functions together
         if event_re:
@@ -510,8 +602,10 @@ class BPF(object):
         ev_name = "p_" + event.replace("+", "_").replace(".", "_")
         desc = "p:kprobes/%s %s" % (ev_name, event)
         res = lib.bpf_attach_kprobe(fn.fd, ev_name.encode("ascii"),
-                desc.encode("ascii"), pid, cpu, group_fd)
-        if res < 0:
+                desc.encode("ascii"), pid, cpu, group_fd,
+                self._reader_cb_impl, ct.cast(id(self), ct.py_object))
+        res = ct.cast(res, ct.c_void_p)
+        if res == None:
             raise Exception("Failed to attach BPF to kprobe")
         open_kprobes[ev_name] = res
         return self
@@ -521,7 +615,7 @@ class BPF(object):
         ev_name = "p_" + event.replace("+", "_").replace(".", "_")
         if ev_name not in open_kprobes:
             raise Exception("Kprobe %s is not attached" % event)
-        os.close(open_kprobes[ev_name])
+        lib.perf_reader_free(open_kprobes[ev_name])
         desc = "-:kprobes/%s" % ev_name
         res = lib.bpf_detach_kprobe(desc.encode("ascii"))
         if res < 0:
@@ -545,8 +639,10 @@ class BPF(object):
         ev_name = "r_" + event.replace("+", "_").replace(".", "_")
         desc = "r:kprobes/%s %s" % (ev_name, event)
         res = lib.bpf_attach_kprobe(fn.fd, ev_name.encode("ascii"),
-                desc.encode("ascii"), pid, cpu, group_fd)
-        if res < 0:
+                desc.encode("ascii"), pid, cpu, group_fd,
+                self._reader_cb_impl, ct.cast(id(self), ct.py_object))
+        res = ct.cast(res, ct.c_void_p)
+        if res == None:
             raise Exception("Failed to attach BPF to kprobe")
         open_kprobes[ev_name] = res
         return self
@@ -556,7 +652,7 @@ class BPF(object):
         ev_name = "r_" + event.replace("+", "_").replace(".", "_")
         if ev_name not in open_kprobes:
             raise Exception("Kretprobe %s is not attached" % event)
-        os.close(open_kprobes[ev_name])
+        lib.perf_reader_free(open_kprobes[ev_name])
         desc = "-:kprobes/%s" % ev_name
         res = lib.bpf_detach_kprobe(desc.encode("ascii"))
         if res < 0:
@@ -597,18 +693,21 @@ class BPF(object):
         fields (task, pid, cpu, flags, timestamp, msg) or None if no
         line was read (nonblocking=True)
         """
-        while True:
-            line = self.trace_readline(nonblocking)
-            if not line and nonblocking: return (None,) * 6
-            # don't print messages related to lost events
-            if line.startswith("CPU:"): continue
-            task = line[:16].lstrip()
-            line = line[17:]
-            ts_end = line.find(":")
-            pid, cpu, flags, ts = line[:ts_end].split()
-            cpu = cpu[1:-1]
-            msg = line[ts_end + 4:]
-            return (task, int(pid), int(cpu), flags, float(ts), msg)
+        try:
+            while True:
+                line = self.trace_readline(nonblocking)
+                if not line and nonblocking: return (None,) * 6
+                # don't print messages related to lost events
+                if line.startswith("CPU:"): continue
+                task = line[:16].lstrip()
+                line = line[17:]
+                ts_end = line.find(":")
+                pid, cpu, flags, ts = line[:ts_end].split()
+                cpu = cpu[1:-1]
+                msg = line[ts_end + 4:]
+                return (task, int(pid), int(cpu), flags, float(ts), msg)
+        except KeyboardInterrupt:
+            exit()
 
     def trace_readline(self, nonblocking=False):
         """trace_readline(nonblocking=False)
@@ -637,15 +736,18 @@ class BPF(object):
         example: trace_print(fmt="pid {1}, msg = {5}")
         """
 
-        while True:
-            if fmt:
-                fields = self.trace_fields(nonblocking=False)
-                if not fields: continue
-                line = fmt.format(*fields)
-            else:
-                line = self.trace_readline(nonblocking=False)
-            print(line)
-            sys.stdout.flush()
+        try:
+            while True:
+                if fmt:
+                    fields = self.trace_fields(nonblocking=False)
+                    if not fields: continue
+                    line = fmt.format(*fields)
+                else:
+                    line = self.trace_readline(nonblocking=False)
+                print(line)
+                sys.stdout.flush()
+        except KeyboardInterrupt:
+            exit()
 
     @staticmethod
     def _load_kallsyms():
@@ -708,3 +810,27 @@ class BPF(object):
             return "[unknown]"
         offset = int(addr - ksym_addrs[idx])
         return ksym_names[idx] + hex(offset)
+
+    @staticmethod
+    def num_open_kprobes():
+        """num_open_kprobes()
+
+        Get the number of open K[ret]probes. Can be useful for scenarios where
+        event_re is used while attaching and detaching probes
+        """
+        return len(open_kprobes)
+
+    def kprobe_poll(self, timeout = -1):
+        """kprobe_poll(self)
+
+        Poll from the ring buffers for all of the open kprobes, calling the
+        cb() that was given in the BPF constructor for each entry.
+        """
+        try:
+            readers = (ct.c_void_p * len(open_kprobes))()
+            for i, v in enumerate(open_kprobes.values()):
+                readers[i] = v
+            lib.perf_reader_poll(len(open_kprobes), readers, timeout)
+        except KeyboardInterrupt:
+            exit()
+
